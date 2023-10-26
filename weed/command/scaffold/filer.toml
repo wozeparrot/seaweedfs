@@ -349,3 +349,8 @@ cert_path=""
 key_path=""
 # The name list used to verify the cn name
 verify_cn=""
+
+[minikeyvalue]
+enabled = false
+server = "http://localhost:3000"
+timeout = "3s"
