@@ -8,6 +8,7 @@ import (
     "net/http"
     "io"
     "encoding/json"
+    "encoding/base64"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -16,7 +17,7 @@ import (
 )
 
 const (
-	DIR_FILE_SEPARATOR = '|'
+	DIR_FILE_SEPARATOR = '.'
 )
 
 func init() {
@@ -315,16 +316,35 @@ func (store *MKVStore) ListDirectoryEntries(ctx context.Context, dirPath weed_ut
 }
 
 func genKey(dirPath, fileName string) (key []byte) {
-	key = []byte(dirPath)
+    // base64 urlencode every section of the dirPath
+    fullpath := weed_util.NewFullPath(dirPath, "")
+    fullpathSplit := fullpath.Split()
+    for i, section := range fullpathSplit {
+        fullpathSplit[i] = base64.URLEncoding.EncodeToString([]byte(section))
+    }
+    // join path
+    fullpath = weed_util.JoinPath(fullpathSplit...)
+    key = []byte("/")
+    key = append(key, []byte(fullpath)...)
 	key = append(key, DIR_FILE_SEPARATOR)
+    // base64 urlencode the filename
+    fileName = base64.URLEncoding.EncodeToString([]byte(fileName))
 	key = append(key, []byte(fileName)...)
 	return key
 }
 
 func genDirectoryKeyPrefix(fullpath weed_util.FullPath, startFileName string) (keyPrefix []byte) {
-	keyPrefix = []byte(string(fullpath))
+    fullpathSplit := fullpath.Split()
+    for i, section := range fullpathSplit {
+        fullpathSplit[i] = base64.URLEncoding.EncodeToString([]byte(section))
+    }
+    fullpath = weed_util.JoinPath(fullpathSplit...)
+    keyPrefix = []byte("/")
+    keyPrefix = append(keyPrefix, []byte(fullpath)...)
 	keyPrefix = append(keyPrefix, DIR_FILE_SEPARATOR)
 	if len(startFileName) > 0 {
+        // base64 urlencode the filename
+        startFileName = base64.URLEncoding.EncodeToString([]byte(startFileName))
 		keyPrefix = append(keyPrefix, []byte(startFileName)...)
 	}
 	return keyPrefix
@@ -336,7 +356,12 @@ func getNameFromKey(key []byte) string {
 		sepIndex--
 	}
 
-	return string(key[sepIndex+1:])
+    name := string(key[sepIndex+1:])
+    nameBytes, err := base64.URLEncoding.DecodeString(name)
+    if err != nil {
+        return ""
+    }
+    return string(nameBytes)
 }
 
 func (store *MKVStore) Shutdown() {}
