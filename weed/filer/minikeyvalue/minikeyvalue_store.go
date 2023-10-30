@@ -117,11 +117,11 @@ func (store *MKVStore) UpdateEntry(ctx context.Context, entry *filer.Entry) (err
     defer cancel()
     req, err := http.NewRequestWithContext(ctx, "UNLINK", store.server + string(key), nil)
     if err != nil {
-        return fmt.Errorf("update %s : %v", entry, err)
+        return fmt.Errorf("update %s : %v", entry.FullPath, err)
     }
     resp, err := http.DefaultClient.Do(req)
     if err != nil || resp.StatusCode != 204 {
-        return fmt.Errorf("update %s : %v", entry, err)
+        return fmt.Errorf("update %s : %v", entry.FullPath, err)
     }
     defer resp.Body.Close()
 
