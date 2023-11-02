@@ -352,5 +352,5 @@ verify_cn=""
 
 [minikeyvalue]
 enabled = false
-server = "http://localhost:3000"
+server = "http://localhost:3000/"
 timeout = "3s"

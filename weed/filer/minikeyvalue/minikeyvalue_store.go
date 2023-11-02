@@ -3,12 +3,12 @@ package minikeyvalue
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
+	"crypto/sha1"
+	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -16,17 +16,13 @@ import (
 	weed_util "github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-const (
-	DIR_FILE_SEPARATOR = '.'
-)
-
 func init() {
 	filer.Stores = append(filer.Stores, &MKVStore{})
+    EncodedDirKeySize = base32.HexEncoding.EncodedLen(sha1.Size)
 }
 
 type MKVStore struct {
-	server  string
-	timeout time.Duration
+	server string
 }
 
 func (store *MKVStore) GetName() string {
@@ -34,45 +30,15 @@ func (store *MKVStore) GetName() string {
 }
 
 func (store *MKVStore) Initialize(configuration weed_util.Configuration, prefix string) (err error) {
-	server := configuration.GetString(prefix + "server")
-	if server == "" {
-		server = "http://localhost:3000"
+	store.server = configuration.GetString(prefix + "server")
+	if store.server == "" {
+		store.server = "http://localhost:3000/"
 	}
 
-	timeout := configuration.GetString(prefix + "timeout")
-	if timeout == "" {
-		timeout = "3s"
-	}
-
-	return store.initialize(server, timeout)
+	return nil
 }
 
-func (store *MKVStore) initialize(server string, timeout string) (err error) {
-	glog.Infof("filer store minikeyvalue: %s", server)
-
-	store.server = server
-
-	to, err := time.ParseDuration(timeout)
-	if err != nil {
-		return fmt.Errorf("parse timeout %s: %s", timeout, err)
-	}
-	store.timeout = to
-
-	// check that the server is pingable
-	ctx, cancel := context.WithTimeout(context.Background(), store.timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", server, nil)
-	if err != nil {
-		return fmt.Errorf("connect to minikeyvalue %s: %v", server, err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("connect to minikeyvalue %s: %v", server, err)
-	}
-	defer resp.Body.Close()
-
-	return
-}
+func (store *MKVStore) Shutdown() {}
 
 func (store *MKVStore) BeginTransaction(ctx context.Context) (context.Context, error) {
 	return ctx, nil
@@ -84,29 +50,46 @@ func (store *MKVStore) RollbackTransaction(ctx context.Context) error {
 	return nil
 }
 
+func (store *MKVStore) Request(ctx context.Context, method string, path string, body []byte) (ret []byte, err error) {
+    ctx, cancel := context.WithTimeout(ctx, weed_util.RetryWaitTime)
+    defer cancel()
+	req := &http.Request{}
+	if body != nil {
+		req, err = http.NewRequestWithContext(ctx, method, store.server+path, bytes.NewReader(body))
+	} else {
+		req, err = http.NewRequestWithContext(ctx, method, store.server+path, nil)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+	ret, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %v", err)
+	}
+	return ret, nil
+}
+
 func (store *MKVStore) InsertEntry(ctx context.Context, entry *filer.Entry) (err error) {
 	key := genKey(entry.DirAndName())
 
 	meta, err := entry.EncodeAttributesAndChunks()
 	if err != nil {
-		return fmt.Errorf("encoding %s %+v: %v", entry.FullPath, entry.Attr, err)
+		return fmt.Errorf("encode entry %s %+v: %v", entry.FullPath, entry.Attr, err)
 	}
 
 	if len(entry.GetChunks()) > filer.CountEntryChunksForGzip {
 		meta = weed_util.MaybeGzipData(meta)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), store.timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "PUT", store.server+string(key), bytes.NewReader(meta))
+	_, err = store.Request(ctx, "PUT", key, meta)
 	if err != nil {
-		return fmt.Errorf("persisting %s: %v", entry.FullPath, err)
+		return fmt.Errorf("persisting entry %s: %v", entry.FullPath, err)
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil || resp.StatusCode != 201 {
-		return fmt.Errorf("persisting %s: %v", entry.FullPath, err)
-	}
-	defer resp.Body.Close()
 
 	return nil
 }
@@ -114,50 +97,41 @@ func (store *MKVStore) InsertEntry(ctx context.Context, entry *filer.Entry) (err
 func (store *MKVStore) UpdateEntry(ctx context.Context, entry *filer.Entry) (err error) {
 	key := genKey(entry.DirAndName())
 
-	ctx, cancel := context.WithTimeout(context.Background(), store.timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "UNLINK", store.server+string(key), nil)
+	meta, err := entry.EncodeAttributesAndChunks()
 	if err != nil {
-		return fmt.Errorf("update %s : %v", entry.FullPath, err)
+		return fmt.Errorf("encode entry %s %+v: %v", entry.FullPath, entry.Attr, err)
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil || resp.StatusCode != 204 {
-		return fmt.Errorf("update %s : %v", entry.FullPath, err)
-	}
-	defer resp.Body.Close()
 
-	return store.InsertEntry(ctx, entry)
+	if len(entry.GetChunks()) > filer.CountEntryChunksForGzip {
+		meta = weed_util.MaybeGzipData(meta)
+	}
+
+	_, err = store.Request(ctx, "PATCH", key, meta)
+	if err != nil {
+		return fmt.Errorf("updating entry %s: %v", entry.FullPath, err)
+	}
+
+	return nil
 }
 
 func (store *MKVStore) FindEntry(ctx context.Context, fullpath weed_util.FullPath) (entry *filer.Entry, err error) {
 	key := genKey(fullpath.DirAndName())
 
-	ctx, cancel := context.WithTimeout(context.Background(), store.timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", store.server+string(key), nil)
+	data, err := store.Request(ctx, "GET", key, nil)
 	if err != nil {
-		return nil, fmt.Errorf("get %s : %v", fullpath, err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("get %s : %v", fullpath, err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("get %s : %v", fullpath, err)
+		return nil, fmt.Errorf("finding entry %s: %v", fullpath, err)
 	}
 
-	if len(body) == 0 || resp.StatusCode != 200 {
+	if data == nil || len(data) == 0 {
 		return nil, filer_pb.ErrNotFound
 	}
 
 	entry = &filer.Entry{
 		FullPath: fullpath,
 	}
-	err = entry.DecodeAttributesAndChunks(weed_util.MaybeDecompressData(body))
+	err = entry.DecodeAttributesAndChunks(weed_util.MaybeDecompressData(data))
 	if err != nil {
-		return entry, fmt.Errorf("decode %s : %v", entry.FullPath, err)
+		return nil, fmt.Errorf("decoding entry %s: %v", fullpath, err)
 	}
 
 	return entry, nil
@@ -166,65 +140,38 @@ func (store *MKVStore) FindEntry(ctx context.Context, fullpath weed_util.FullPat
 func (store *MKVStore) DeleteEntry(ctx context.Context, fullpath weed_util.FullPath) (err error) {
 	key := genKey(fullpath.DirAndName())
 
-	ctx, cancel := context.WithTimeout(context.Background(), store.timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "DELETE", store.server+string(key), nil)
-	if err != nil {
-		return fmt.Errorf("delete %s : %v", fullpath, err)
+    data, err := store.Request(ctx, "DELETE", key, nil)
+	if err != nil || data == nil {
+		return fmt.Errorf("deleting entry %s: %v", fullpath, err)
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil || resp.StatusCode != 204 {
-		return fmt.Errorf("delete %s : %v", fullpath, err)
-	}
-	defer resp.Body.Close()
 
 	return nil
 }
 
 func (store *MKVStore) DeleteFolderChildren(ctx context.Context, fullpath weed_util.FullPath) (err error) {
-	directoryPrefix := genDirectoryKeyPrefix(fullpath, "")
+	directoryKey := genDirectoryKey(string(fullpath))
 
-	glog.V(4).Infof("delete folder children %s, prefix %s", fullpath, directoryPrefix)
-
-	ctx, cancel := context.WithTimeout(context.Background(), store.timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", store.server+string(directoryPrefix)+"?list", nil)
-	if err != nil {
-		return fmt.Errorf("list %s : %v", directoryPrefix, err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("list %s : %v", directoryPrefix, err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("list %s : %v", directoryPrefix, err)
+	data, err := store.Request(ctx, "GET", directoryKey+"?list", nil)
+	if err != nil || data == nil {
+		return fmt.Errorf("finding directory %s: %v", fullpath, err)
 	}
 
-	var data map[string]interface{}
-	err = json.Unmarshal(body, &data)
+	var parsedData map[string]interface{}
+	err = json.Unmarshal(data, &parsedData)
 	if err != nil {
-		return fmt.Errorf("list %s : %v", directoryPrefix, err)
+		return fmt.Errorf("parsing directory %s: %v", fullpath, err)
 	}
-	keys, ok := data["keys"].([]interface{})
+	keys, ok := parsedData["keys"].([]interface{})
 	if !ok {
-		return fmt.Errorf("list %s : %v", directoryPrefix, err)
+		return fmt.Errorf("parsing directory keys %s: %v", fullpath, err)
 	}
 
 	for _, key := range keys {
-		key := []byte(key.(string))
-		ctx, cancel := context.WithTimeout(context.Background(), store.timeout)
-		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, "DELETE", store.server+string(key), nil)
+		key := key.(string)[1:]
+		_, err = store.Request(ctx, "DELETE", key, nil)
 		if err != nil {
-			return fmt.Errorf("delete %s : %v", fullpath, err)
+			return fmt.Errorf("deleting entry %s: %v", fullpath, err)
 		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil || resp.StatusCode != 204 {
-			return fmt.Errorf("delete %s : %v", fullpath, err)
-		}
-		defer resp.Body.Close()
 	}
 
 	return nil
@@ -235,133 +182,97 @@ func (store *MKVStore) ListDirectoryPrefixedEntries(ctx context.Context, dirPath
 }
 
 func (store *MKVStore) ListDirectoryEntries(ctx context.Context, dirPath weed_util.FullPath, startFileName string, includeStartFile bool, limit int64, eachEntryFunc filer.ListEachEntryFunc) (lastFileName string, err error) {
-	directoryPrefix := genDirectoryKeyPrefix(dirPath, "")
-	lastFileStart := directoryPrefix
-	if startFileName != "" {
-		lastFileStart = genDirectoryKeyPrefix(dirPath, startFileName)
+	directoryKey := genDirectoryKey(string(dirPath))
+	encodedStartFileName := encodeFileName(startFileName)
+	lastFileStart := directoryKey + encodedStartFileName
+
+    glog.V(4).Infof("list directory %s from %s", dirPath, lastFileStart)
+
+	data, err := store.Request(ctx, "GET", directoryKey+"?list&limit="+fmt.Sprint(limit)+"&start=/"+lastFileStart, nil)
+	if err != nil || data == nil {
+		return lastFileName, fmt.Errorf("finding directory %s: %v", dirPath, err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), store.timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", store.server+string(lastFileStart)+"?list", nil)
+	var parsedData map[string]interface{}
+	err = json.Unmarshal(data, &parsedData)
 	if err != nil {
-		return lastFileName, fmt.Errorf("list %s : %v", dirPath, err)
+		return lastFileName, fmt.Errorf("parsing directory %s: %v", dirPath, err)
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return lastFileName, fmt.Errorf("list %s : %v", dirPath, err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return lastFileName, fmt.Errorf("list %s : %v", dirPath, err)
-	}
-
-	var data map[string]interface{}
-	err = json.Unmarshal(body, &data)
-	if err != nil {
-		return lastFileName, fmt.Errorf("list %s : %v", dirPath, err)
-	}
-	keys, ok := data["keys"].([]interface{})
+	keys, ok := parsedData["keys"].([]interface{})
 	if !ok {
-		return lastFileName, fmt.Errorf("list %s : %v", dirPath, err)
+		return lastFileName, fmt.Errorf("parsing directory keys %s: %v", dirPath, err)
 	}
 
 	for _, key := range keys {
-		key := []byte(key.(string))
-		if !bytes.HasPrefix(key, directoryPrefix) {
-			break
-		}
+		key := key.(string)[1:]
 		fileName := getNameFromKey(key)
-		if fileName == "" {
+		if fileName == "" || (!includeStartFile && fileName == encodedStartFileName) {
 			continue
 		}
-		if fileName == startFileName && !includeStartFile {
-			continue
-		}
+
 		limit--
 		if limit < 0 {
 			break
 		}
-		entry := &filer.Entry{
-			FullPath: weed_util.NewFullPath(string(dirPath), fileName),
-		}
 
-		// make a request to get the entry
-		ctx, cancel := context.WithTimeout(context.Background(), store.timeout)
-		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, "GET", store.server+string(key), nil)
+		decodedFileName, err := decodeFileName(fileName)
 		if err != nil {
-			return lastFileName, fmt.Errorf("list %s : %v", entry.FullPath, err)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return lastFileName, fmt.Errorf("list %s : %v", entry.FullPath, err)
-		}
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-
-		if decodeErr := entry.DecodeAttributesAndChunks(weed_util.MaybeDecompressData(body)); decodeErr != nil {
-			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).Infof("decoding file name %s: %v", fileName, err)
 			break
 		}
+		entry := &filer.Entry{
+			FullPath: weed_util.NewFullPath(string(dirPath), decodedFileName),
+		}
+
+		data, err := store.Request(ctx, "GET", key, nil)
+		if err != nil {
+			glog.V(0).Infof("finding entry %s: %v", entry.FullPath, err)
+			break
+		}
+
+		if decodeErr := entry.DecodeAttributesAndChunks(weed_util.MaybeDecompressData(data)); decodeErr != nil {
+			err = decodeErr
+			glog.V(0).Infof("decoding entry %s: %v", entry.FullPath, err)
+			break
+		}
+
 		if !eachEntryFunc(entry) {
 			break
 		}
-		lastFileName = fileName
+		lastFileName = decodedFileName
 	}
 
 	return lastFileName, err
 }
 
-func genKey(dirPath, fileName string) (key []byte) {
-	// base64 urlencode every section of the dirPath
-	fullpath := weed_util.NewFullPath(dirPath, "")
-	fullpathSplit := fullpath.Split()
-	for i, section := range fullpathSplit {
-		fullpathSplit[i] = base64.URLEncoding.EncodeToString([]byte(section))
-	}
-	// join path
-	fullpath = weed_util.JoinPath(fullpathSplit...)
-	key = []byte("/")
-	key = append(key, []byte(fullpath)...)
-	key = append(key, DIR_FILE_SEPARATOR)
-	// base64 urlencode the filename
-	fileName = base64.URLEncoding.EncodeToString([]byte(fileName))
-	key = append(key, []byte(fileName)...)
-	return key
+func hashToString(str string) string {
+    s := sha1.Sum([]byte(str))
+    return base32.HexEncoding.EncodeToString(s[:])
 }
 
-func genDirectoryKeyPrefix(fullpath weed_util.FullPath, startFileName string) (keyPrefix []byte) {
-	fullpathSplit := fullpath.Split()
-	for i, section := range fullpathSplit {
-		fullpathSplit[i] = base64.URLEncoding.EncodeToString([]byte(section))
-	}
-	fullpath = weed_util.JoinPath(fullpathSplit...)
-	keyPrefix = []byte("/")
-	keyPrefix = append(keyPrefix, []byte(fullpath)...)
-	keyPrefix = append(keyPrefix, DIR_FILE_SEPARATOR)
-	if len(startFileName) > 0 {
-		// base64 urlencode the filename
-		startFileName = base64.URLEncoding.EncodeToString([]byte(startFileName))
-		keyPrefix = append(keyPrefix, []byte(startFileName)...)
-	}
-	return keyPrefix
+func encodeFileName(name string) string {
+	return base32.HexEncoding.EncodeToString([]byte(name))
 }
 
-func getNameFromKey(key []byte) string {
-	sepIndex := len(key) - 1
-	for sepIndex >= 0 && key[sepIndex] != DIR_FILE_SEPARATOR {
-		sepIndex--
-	}
-
-	name := string(key[sepIndex+1:])
-	nameBytes, err := base64.URLEncoding.DecodeString(name)
+func decodeFileName(name string) (string, error) {
+	data, err := base32.HexEncoding.DecodeString(name)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return string(nameBytes)
+	return string(data), nil
 }
 
-func (store *MKVStore) Shutdown() {}
+func genKey(dir string, name string) string {
+	key := hashToString(dir)
+	name = encodeFileName(name)
+	return key + name
+}
+
+func genDirectoryKey(dir string) string {
+	return hashToString(dir)
+}
+
+var EncodedDirKeySize int
+func getNameFromKey(key string) string {
+	return key[EncodedDirKeySize:]
+}
