@@ -3,8 +3,7 @@ package minikeyvalue
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
-	"encoding/base32"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,11 +13,12 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	weed_util "github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/zeebo/blake3"
 )
 
 func init() {
 	filer.Stores = append(filer.Stores, &MKVStore{})
-    EncodedDirKeySize = base32.HexEncoding.EncodedLen(sha1.Size)
+    EncodedDirKeySize = base64.URLEncoding.EncodedLen(blake3.New().Size())
 }
 
 type MKVStore struct {
@@ -246,16 +246,16 @@ func (store *MKVStore) ListDirectoryEntries(ctx context.Context, dirPath weed_ut
 }
 
 func hashToString(str string) string {
-    s := sha1.Sum([]byte(str))
-    return base32.HexEncoding.EncodeToString(s[:])
+    s := blake3.Sum256([]byte(str))
+    return base64.URLEncoding.EncodeToString(s[:])
 }
 
 func encodeFileName(name string) string {
-	return base32.HexEncoding.EncodeToString([]byte(name))
+    return base64.URLEncoding.EncodeToString([]byte(name))
 }
 
 func decodeFileName(name string) (string, error) {
-	data, err := base32.HexEncoding.DecodeString(name)
+	data, err := base64.URLEncoding.DecodeString(name)
 	if err != nil {
 		return "", err
 	}
