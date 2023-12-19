@@ -16,6 +16,8 @@ global:
       volumeRead: false
       filerWrite: false
       filerRead: false
+  # we will use this serviceAccountName for all ClusterRoles/ClusterRoleBindings
+  serviceAccountName: "seaweedfs"
   certificates:
     alphacrds: false
   monitoring:
@@ -137,7 +139,7 @@ master:
   # ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector
   # Example:
   nodeSelector: |
-    beta.kubernetes.io/arch: amd64
+    kubernetes.io/arch: amd64
   # nodeSelector: |
   #   sw-backend: "true"
 
@@ -321,7 +323,7 @@ volume:
   # ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector
   # Example:
   nodeSelector: |
-   beta.kubernetes.io/arch: amd64
+   kubernetes.io/arch: amd64
   # nodeSelector: |
   #   sw-volume: "true"
 
@@ -468,7 +470,7 @@ filer:
   # ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector
   # Example:
   nodeSelector: |
-    beta.kubernetes.io/arch: amd64
+    kubernetes.io/arch: amd64
   # nodeSelector: |
   #   sw-backend: "true"
 
@@ -570,12 +572,19 @@ filer:
     # Suffix of the host name, {bucket}.{domainName}
     domainName: ""
     # enable user & permission to s3 (need to inject to all services)
-    enableAuth: false
+    enableAuth: true
     skipAuthSecretCreation: false
     # set to the name of an existing kubernetes Secret with the s3 json config file
     # should have a secret key called seaweedfs_s3_config with an inline json configure
     existingConfigSecret: ""
     auditLogConfig: {}
+    # You may specify buckets to be created during the install process.
+    # Buckets may be exposed publicly by setting `anonymousRead` to `true`
+    # createBuckets:
+    #   - name: bucket-a
+    #     anonymousRead: true
+    #   - name: bucket-b
+    #     anonymousRead: false
 
 s3:
   enabled: false
@@ -597,7 +606,7 @@ s3:
   skipAuthSecretCreation: false
   # set to the name of an existing kubernetes Secret with the s3 json config file
   # should have a secret key called seaweedfs_s3_config with an inline json config
-  existingConfigSecret: ""
+  existingConfigSecret: false
   auditLogConfig: {}
 
   # Suffix of the host name, {bucket}.{domainName}
@@ -623,7 +632,7 @@ s3:
   # ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector
   # Example:
   nodeSelector: |
-    beta.kubernetes.io/arch: amd64
+    kubernetes.io/arch: amd64
   # nodeSelector: |
   #   sw-backend: "true"
 
