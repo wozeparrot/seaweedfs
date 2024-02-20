@@ -183,12 +183,15 @@ spec:
           resources:
             {{ tpl .Values.s3.resources . | nindent 12 | trim }}
           {{- end }}
+      {{- if .Values.s3.sidecars }}
+      {{- include "common.tplvalues.render" (dict "value" .Values.s3.sidecars "context" $) | nindent 8 }}
+      {{- end }}
       volumes:
         {{- if .Values.s3.enableAuth }}
         - name: config-users
           secret:
             defaultMode: 420
-            {{- if .Values.filer.s3.existingConfigSecret }}
+            {{- if .Values.s3.existingConfigSecret }}
             secretName: {{ .Values.s3.existingConfigSecret }}
             {{- else }}
             secretName: seaweedfs-s3-secret
