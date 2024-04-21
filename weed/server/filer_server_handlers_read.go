@@ -3,6 +3,9 @@ package weed_server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -14,6 +17,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
@@ -118,8 +122,11 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if query.Get("metadata") == "true" {
-			writeJsonQuiet(w, r, http.StatusOK, entry)
-			return
+			// Don't return directory meta if config value is set to true
+			if fs.option.ExposeDirectoryData == false {
+				writeJsonError(w, r, http.StatusForbidden, errors.New("directory listing is disabled"))
+				return
+			}
 		}
 		if entry.Attr.Mime == "" || (entry.Attr.Mime == s3_constants.FolderMimeType && r.Header.Get(s3_constants.AmzIdentityId) == "") {
 			// return index of directory for non s3 gateway
@@ -127,7 +134,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		// inform S3 API this is a user created directory key object
-		w.Header().Set(s3_constants.X_SeaweedFS_Header_Directory_Key, "true")
+		w.Header().Set(s3_constants.SeaweedFSIsDirectoryKey, "true")
 	}
 
 	if isForDirectory && entry.Attr.Mime != s3_constants.FolderMimeType {
@@ -153,7 +160,22 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	etag := filer.ETagEntry(entry)
+	var etag string
+	if partNumber, errNum := strconv.Atoi(r.Header.Get(s3_constants.SeaweedFSPartNumber)); errNum == nil {
+		if len(entry.Chunks) < partNumber {
+			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadChunk).Inc()
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte("InvalidPart"))
+			return
+		}
+		w.Header().Set(s3_constants.AmzMpPartsCount, strconv.Itoa(len(entry.Chunks)))
+		partChunk := entry.GetChunks()[partNumber-1]
+		md5, _ := base64.StdEncoding.DecodeString(partChunk.ETag)
+		etag = hex.EncodeToString(md5)
+		r.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", partChunk.Offset, uint64(partChunk.Offset)+partChunk.Size-1))
+	} else {
+		etag = filer.ETagEntry(entry)
+	}
 	w.Header().Set("Accept-Ranges", "bytes")
 
 	// mime type
@@ -202,7 +224,6 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 
 	filename := entry.Name()
 	adjustPassthroughHeaders(w, r, filename)
-
 	totalSize := int64(entry.Size())
 
 	if r.Method == "HEAD" {
@@ -257,7 +278,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 
-		streamFn, err := filer.PrepareStreamContentWithThrottler(fs.filer.MasterClient, chunks, offset, size, fs.option.DownloadMaxBytesPs)
+		streamFn, err := filer.PrepareStreamContentWithThrottler(fs.filer.MasterClient, fs.maybeGetVolumeReadJwtAuthorizationToken, chunks, offset, size, fs.option.DownloadMaxBytesPs)
 		if err != nil {
 			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadStream).Inc()
 			glog.Errorf("failed to prepare stream content %s: %v", r.URL, err)
@@ -272,4 +293,8 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 			return err
 		}, nil
 	})
+}
+
+func (fs *FilerServer) maybeGetVolumeReadJwtAuthorizationToken(fileId string) string {
+	return string(security.GenJwtForVolumeServer(fs.volumeGuard.ReadSigningKey, fs.volumeGuard.ReadExpiresAfterSec, fileId))
 }
